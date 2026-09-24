@@ -1,0 +1,101 @@
+name: PR build, deploy & gate checks
+
+# Runs on every PR into main: build (with keys.ts frozen), install onto a
+# shared non-prod test instance, then gate on an ATF suite run. See
+# docs/ci-setup.md for the setup this depends on.
+
+on:
+  pull_request:
+    branches: [main]
+
+# A shared ServiceNow instance is a single external resource -- serialize
+# installs against it instead of letting concurrent PR runs race each other.
+concurrency:
+  group: now-sdk-instance-install
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (frozen keys)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      # Fails if `now-sdk build` would change src/fluent/generated/keys.ts --
+      # i.e. someone added/changed a Now.ID without committing the regenerated
+      # keys file. See: npx @servicenow/sdk explain ci-integration
+      - name: Build (validate keys.ts is up to date)
+        run: npm run build:ci
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+          retention-days: 1
+
+  # Skipped for PRs from forks: GitHub does not expose secrets to
+  # pull_request-triggered runs from a fork, so auth to the instance would
+  # fail anyway. Maintainers should re-run this job manually (or via
+  # workflow_dispatch) after reviewing a fork PR, before merging.
+  install-and-atf:
+    name: Install to test instance & run ATF gate
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Download build output
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+
+      # Non-interactive CI auth: see
+      # npx @servicenow/sdk explain ci-integration
+      - name: Install app on test instance
+        env:
+          SN_SDK_NODE_ENV: SN_SDK_CI_INSTALL
+          SN_SDK_AUTH_TYPE: oauth
+          SN_SDK_INSTANCE_URL: ${{ vars.SN_SDK_INSTANCE_URL }}
+          SN_SDK_OAUTH_CLIENT_ID: ${{ secrets.SN_SDK_OAUTH_CLIENT_ID }}
+          SN_SDK_OAUTH_CLIENT_SECRET: ${{ secrets.SN_SDK_OAUTH_CLIENT_SECRET }}
+        run: npm run deploy
+
+      - name: Run ATF gate suite
+        env:
+          SN_SDK_INSTANCE_URL: ${{ vars.SN_SDK_INSTANCE_URL }}
+          SN_SDK_OAUTH_CLIENT_ID: ${{ secrets.SN_SDK_OAUTH_CLIENT_ID }}
+          SN_SDK_OAUTH_CLIENT_SECRET: ${{ secrets.SN_SDK_OAUTH_CLIENT_SECRET }}
+          ATF_TEST_SUITE_ID: ${{ vars.ATF_TEST_SUITE_ID }}
+        run: node tools/run-atf-suite.mjs
+
+  gate:
+    name: Required gate checks
+    needs: [build, install-and-atf]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Fail if any gate check did not succeed
+        run: |
+          for result in "${{ needs.build.result }}" "${{ needs.install-and-atf.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "A required gate check did not succeed (status: $result)."
+              exit 1
+            fi
+          done
