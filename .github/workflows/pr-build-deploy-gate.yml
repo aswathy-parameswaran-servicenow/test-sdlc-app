@@ -1,12 +1,15 @@
 name: PR build, deploy & gate checks
 
 # Runs on every PR into main: build (with keys.ts frozen), install onto a
-# shared non-prod test instance, then gate on an ATF suite run. See
-# docs/ci-setup.md for the setup this depends on.
+# shared non-prod test instance, then gate on an ATF suite run. Also
+# runnable manually via workflow_dispatch (e.g. to re-run after reviewing a
+# fork PR, or to test the pipeline outside a PR). See docs/ci-setup.md for
+# the setup this depends on.
 
 on:
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
 
 # A shared ServiceNow instance is a single external resource -- serialize
 # installs against it instead of letting concurrent PR runs race each other.
@@ -43,13 +46,14 @@ jobs:
 
   # Skipped for PRs from forks: GitHub does not expose secrets to
   # pull_request-triggered runs from a fork, so auth to the instance would
-  # fail anyway. Maintainers should re-run this job manually (or via
-  # workflow_dispatch) after reviewing a fork PR, before merging.
+  # fail anyway. Maintainers should re-run this job manually via
+  # workflow_dispatch after reviewing a fork PR, before merging. Manual
+  # (workflow_dispatch) runs always proceed, since they aren't tied to a PR.
   install-and-atf:
     name: Install to test instance & run ATF gate
     needs: build
     runs-on: ubuntu-latest
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
 
