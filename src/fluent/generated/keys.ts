@@ -41,14 +41,6 @@ declare global {
                         table: 'sys_atf_test_suite'
                         id: 'c7fe4e024806453da1a9adb0afa9d1d7'
                     }
-                    'sdlc-issue-ci-gate-suite-test-form': {
-                        table: 'sys_atf_test_suite_test'
-                        id: '2484bf242751441685fa29983e80233d'
-                    }
-                    'sdlc-issue-ci-gate-suite-test-nav': {
-                        table: 'sys_atf_test_suite_test'
-                        id: '137051e78c0349babda94870ff0e0560'
-                    }
                     'sdlc-issue-list-module': {
                         table: 'sys_app_module'
                         id: '1d8d8beddf834e59b2259b91fce13c8c'
@@ -453,6 +445,14 @@ declare global {
                         }
                     },
                     {
+                        table: 'sys_atf_test_suite_test'
+                        id: '51fc5d464be7443fb4d31e85786fa99e'
+                        key: {
+                            test_suite: 'c7fe4e024806453da1a9adb0afa9d1d7'
+                            test: '7884ee5dd220433fbd08b0681810cbeb'
+                        }
+                    },
+                    {
                         table: 'sys_choice'
                         id: '53142077ed464f6da04f0d1999430500'
                         key: {
@@ -499,6 +499,14 @@ declare global {
                         key: {
                             name: 'x_test_sdlc_app_sdlc_issue'
                             element: 'state'
+                        }
+                    },
+                    {
+                        table: 'sys_atf_test_suite_test'
+                        id: '5b6c08c5bfdb49eba36fb141dda2498a'
+                        key: {
+                            test_suite: 'c7fe4e024806453da1a9adb0afa9d1d7'
+                            test: '0591be8e38064e5e95c7e56842df1dee'
                         }
                     },
                     {

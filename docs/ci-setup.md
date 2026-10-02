@@ -1,18 +1,44 @@
 # CI setup for `.github/workflows/pr-build-deploy-gate.yml`
 
-This app's PR workflow builds with frozen keys, installs to a shared
-non-prod test instance, then gates the merge on an ATF suite run. It needs
-the following one-time setup. See also:
-`npx @servicenow/sdk explain ci-integration`.
+This app's workflow builds with frozen keys, then always installs
+directly to `dev` and runs the ATF gate suite there. On a merge to `main`
+(push), or a `workflow_dispatch` run that explicitly chose `staging`, it
+additionally **promotes** the app: publish from dev to the Application
+Repository (`now-sdk cicd publish`), install that published version onto
+`staging` from the repository (`now-sdk cicd install`), then run the ATF
+suite on staging via the CI/CD API (`now-sdk cicd testsuite run`). A push
+event can't block the merge that already happened, so this reports
+post-merge/promotion health rather than gating anything.
 
-## 1. Target instance
+Direct `now-sdk install` (the raw SDK install, no Application Repository
+involved) only ever targets `dev`. `staging` -- standing in for a real
+production instance here -- always installs from the Application
+Repository instead, per the SDK's own guidance that direct install is for
+the development instance only. See `npx @servicenow/sdk explain
+sdlc-guide` and `npx @servicenow/sdk explain ci-integration` for the full
+background on both of these.
 
-Pick a shared, non-prod ServiceNow instance (dev/test/integration) that PR
-branches can install to. Do not point this at production -- CI installs
-should never go straight to prod; use the platform's normal app promotion
-path for that.
+## 1. Target instances
 
-## 2. OAuth Application Registry (instance side)
+Pick two shared, non-prod ServiceNow instances: one to act as `dev`
+(where code is installed directly and iterated on), one as `staging`
+(which only ever installs from the Application Repository -- the same
+path a real production instance would use). Do not point `staging` at an
+actual production instance without re-reading the SDLC guide's guidance
+on approvals and rollback first; CI installs should never go straight to
+a real production instance without that process around them.
+
+## 2. Instance-side setup
+
+### Application Repository
+
+Application Repository is provisioned automatically for commercial SaaS
+instances, at `https://apprepo.service-now.com`. Both `dev` and `staging`
+need to be entitled to publish/install the app's versions there --
+confirm this with whoever administers Application Repository access for
+your instances if publish/install calls get rejected.
+
+### OAuth Application Registry (repeat per instance)
 
 1. **System OAuth > Application Registry > New >** "Create an OAuth API
    endpoint for external clients".
@@ -22,54 +48,117 @@ path for that.
 2. Ensure the system property
    `glide.oauth.inbound.client.credential.grant_type.enabled` exists and is
    `true` (create it under `sys_properties` if missing).
-3. Create a dedicated service user for CI installs:
-   - Roles sufficient to install the app (typically `admin`)
-   - `Identity Type = Human` (a `Machine` identity is blocked from the
-     session bootstrap the SDK's OAuth flow performs)
-4. Note the Application Registry's **Client ID** and **Client Secret**.
+3. Create a dedicated service user for CI, with roles matching what that
+   instance does in the pipeline:
+   - **dev** (direct install + publish source): `admin`, or a custom role
+     granting write access to `sys_app`/`sys_app_file`/`sys_update_xml`,
+     plus the target application scope role, plus the CI/CD developer and
+     app lifecycle publisher roles required to publish.
+   - **staging** (installs from Application Repository, runs ATF): the
+     CI/CD admin role, the app lifecycle publisher role, and the target
+     scope role.
+   - Both: `Identity Type = Human` (a `Machine` identity is blocked from
+     the session bootstrap the SDK's OAuth flow performs for direct
+     install; the CI/CD API path doesn't need this, but keeping it
+     consistent avoids surprises if a service user is ever reused).
+4. Note each Application Registry's **Client ID** and **Client Secret**.
 
 ## 3. GitHub repo configuration
 
-**Repository variables** (Settings > Secrets and variables > Actions > Variables):
+### Per-instance: GitHub Environments
+
+Create one [GitHub Environment](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment)
+per instance -- `dev` and `staging`. Jobs declare `environment: dev` or
+`environment: staging` directly (see the workflow file), so each
+environment's own variables/secrets are what that job sees -- a job
+targeting `dev` can never read `staging`'s secrets, or vice versa.
+
+For each environment, set:
+
+**Environment variables:**
 
 | Name | Value |
 |---|---|
-| `SN_SDK_INSTANCE_URL` | `https://<your-test-instance>.service-now.com` |
-| `ATF_TEST_SUITE_ID` | sys_id of the `SDLC Issue CI Gate Suite` (`sys_atf_test_suite`) -- look up the `sdlc-issue-ci-gate-suite` entry in `src/fluent/generated/keys.ts` after building, or query the instance once installed: `npx @servicenow/sdk query sys_atf_test_suite -q "name=SDLC Issue CI Gate Suite" -o json` |
+| `SN_SDK_INSTANCE_URL` | `https://<that-environment's-instance>.service-now.com` (no trailing slash -- one is appended by the SDK's OAuth code path and a double slash breaks the upload endpoint) |
 
-**Repository secrets** (Settings > Secrets and variables > Actions > Secrets):
+**Environment secrets:**
 
 | Name | Value |
 |---|---|
-| `SN_SDK_OAUTH_CLIENT_ID` | Client ID from step 2 |
-| `SN_SDK_OAUTH_CLIENT_SECRET` | Client Secret from step 2 |
+| `SN_SDK_OAUTH_CLIENT_ID` | Client ID from step 2, for that instance |
+| `SN_SDK_OAUTH_CLIENT_SECRET` | Client Secret from step 2, for that instance |
+
+```
+gh api --method PUT repos/<owner>/<repo>/environments/<env-name>
+gh variable set SN_SDK_INSTANCE_URL --env <env-name> --body "https://<instance>.service-now.com"
+gh secret set SN_SDK_OAUTH_CLIENT_ID --env <env-name> --body "<client-id>"
+gh secret set SN_SDK_OAUTH_CLIENT_SECRET --env <env-name>   # paste value when prompted
+```
+
+### Repo-level (shared across every instance)
+
+| Name | Value |
+|---|---|
+| `ATF_TEST_SUITE_ID` | sys_id of the `SDLC Issue CI Gate Suite` (`sys_atf_test_suite`) -- look up the `sdlc-issue-ci-gate-suite` entry in `src/fluent/generated/keys.ts`. This is generated by `Now.ID` at **build time**, not install time -- it's the same literal `sys_id` on every instance the app gets installed to, so it's a plain repo variable, not duplicated per environment. |
+
+Do not set `SN_SDK_INSTANCE_URL` / `SN_SDK_OAUTH_CLIENT_ID` / `SN_SDK_OAUTH_CLIENT_SECRET` at the repo level once environments are in use -- repo-level values would only apply to a job that *doesn't* declare an `environment:`, which isn't the case here, so leaving stale repo-level copies around just invites confusion about which value is actually in effect.
+
+### Required: bump the version before every promotion
+
+Application Repository versions are **immutable** -- `now-sdk cicd
+publish` fails if the version in `package.json` has already been
+published. Bump `version` in `package.json` (and tag the commit to
+match) before merging any change that's meant to promote to staging. A
+PR that doesn't bump the version can still merge and install fine on
+`dev`, but `publish-to-app-repo` will fail on that merge if the version
+was already published previously.
 
 ## 4. What the workflow does
 
 1. **`build`** -- `npm run build:ci` (`now-sdk build --frozenKeys`). Fails if
    someone introduced a new/changed `Now.ID` without committing the
    regenerated `src/fluent/generated/keys.ts`.
-2. **`install-and-atf`** (skipped for fork PRs, since forks don't get
-   secrets) -- installs the built app to the test instance via OAuth
-   `client_credentials`, then runs `tools/run-atf-suite.mjs`, which:
-   - Fetches an access token from `/oauth_token.do`.
-   - Starts the `ATF_TEST_SUITE_ID` suite via
-     `POST /api/now/v1/atf/test_suite/{id}/run`.
-   - Polls `sys_atf_execution_tracker` until the run reaches a terminal
-     status (`success`, `failure`, `cancelled`, `error`), failing the job
-     unless the result is `success`.
-3. **`gate`** -- a single required status check that fails if either job
-   above didn't succeed. Point the branch protection rule at this job.
+2. **`install-dev`** (skipped for fork PRs, since forks don't get secrets)
+   -- always runs. Installs the built app directly to `dev` via OAuth
+   `client_credentials` (`npm run deploy`), then runs
+   `tools/run-atf-suite.mjs` against it: starts the `ATF_TEST_SUITE_ID`
+   suite via `POST /api/now/v1/atf/test_suite/{id}/run`, polls
+   `sys_atf_execution_tracker` until it reaches a terminal status, and
+   fails unless the result is `success`.
+3. **`publish-to-app-repo`** -- only on a push to `main`, or a
+   `workflow_dispatch` run with `target_environment: staging`. Runs
+   `now-sdk cicd publish`, which snapshots dev's *currently installed*
+   app state (just confirmed healthy by `install-dev`) into the
+   Application Repository as an immutable, versioned artifact. Does not
+   use the local build zip.
+4. **`install-staging`** -- needs `publish-to-app-repo`. Runs
+   `now-sdk cicd install` to install that published version onto
+   `staging` from the Application Repository, then
+   `now-sdk cicd testsuite run --test-suite-sys-id <id>` to run the ATF
+   suite there (this command polls and waits on its own, replacing the
+   custom script used for `dev`).
+5. **`gate`** -- a single required status check that fails if any job
+   above that actually ran didn't succeed (a skipped promotion on a plain
+   PR run is not a failure). Point the branch protection rule at this job.
 
 ## 5. Fork PRs
 
 `pull_request` runs from forks don't receive repo secrets, so
-`install-and-atf` (and therefore `gate`) will fail for them by design.
-After reviewing a fork PR, a maintainer should re-run the workflow from a
-context that has the secrets (e.g. push to a branch in this repo, or use
-`workflow_dispatch` if added later) before merging.
+`install-dev` (and therefore `gate`) will fail for them by design.
+After reviewing a fork PR, a maintainer should re-run the workflow via
+`workflow_dispatch` (Actions tab > this workflow > Run workflow) before
+merging.
 
-## 6. Adding more ATF coverage
+## 6. Rollback
+
+If a promotion needs to be reverted, `now-sdk cicd rollback --app-version
+<previous-version>` reverts an instance to a previously published
+version via the Application Repository -- this isn't wired into the
+workflow automatically; run it manually (locally, or via
+`workflow_dispatch` on a separate rollback workflow if one gets added
+later).
+
+## 7. Adding more ATF coverage
 
 The gate suite (`src/fluent/tests/sdlc-issue-ci-gate-suite.now.ts`) currently
 runs two representative tests:
@@ -79,6 +168,6 @@ runs two representative tests:
 - `sdlc-issue-modules-visible-test` -- confirms the SDLC Issues application
   menu's modules are visible and navigable.
 
-To add more, define a new `Test()` in `src/fluent/tests/`, then add a
-`sys_atf_test_suite_test` `Record()` linking it to `sdlcIssueCiGateSuite` in
+To add more, define a new `Test()` in `src/fluent/tests/`, then add it to
+the `tests: [...]` array in the `TestSuite()` call in
 `sdlc-issue-ci-gate-suite.now.ts`.
