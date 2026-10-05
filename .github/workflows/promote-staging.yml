@@ -1,0 +1,137 @@
+name: Promote to staging
+
+# Runs after a merge to main: builds independently (does not reuse
+# pr-dev-gate.yml's artifact -- a different build context, per the
+# decision to keep these workflows separate), publishes that build from
+# dev to the Application Repository, installs the published version onto
+# staging from the repository, and runs the ATF suite there.
+#
+# This can't block the merge that already happened -- a push event fires
+# after the fact -- so it reports post-merge/promotion health rather than
+# gating anything. Also runnable manually via workflow_dispatch to
+# re-trigger a promotion without a new merge.
+#
+# Direct `now-sdk install` is never used here: staging (standing in for a
+# real production instance in this repo) always installs from the
+# Application Repository via `now-sdk cicd`, per the SDK's own guidance
+# that direct install is for the development instance only -- see
+# `npx @servicenow/sdk explain sdlc-guide` and docs/ci-setup.md.
+#
+# IMPORTANT: Application Repository versions are immutable -- publishing
+# a version that already exists fails. Bump `version` in package.json
+# (and tag the commit to match) before merging any change meant to
+# promote to staging.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# staging is a single shared external resource -- serialize promotions
+# against it instead of letting concurrent runs race each other.
+concurrency:
+  group: now-sdk-staging-promote
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (frozen keys)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      # Fails if `now-sdk build` would change src/fluent/generated/keys.ts --
+      # i.e. someone added/changed a Now.ID without committing the regenerated
+      # keys file. See: npx @servicenow/sdk explain ci-integration
+      #
+      # No artifact upload here: `now-sdk cicd publish` snapshots dev's
+      # currently-installed state, not a local build zip, so nothing from
+      # this build gets carried into the jobs below. This step exists
+      # only to validate keys.ts before promoting.
+      - name: Build (validate keys.ts is up to date)
+        run: npm run build:ci
+
+  publish-to-app-repo:
+    name: Publish to Application Repository (from dev)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    outputs:
+      app-version: ${{ steps.publish.outputs.app-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Publish to Application Repository
+        id: publish
+        env:
+          SN_SDK_NODE_ENV: SN_SDK_CI_INSTALL
+          SN_SDK_AUTH_TYPE: oauth
+          SN_SDK_INSTANCE_URL: ${{ vars.SN_SDK_INSTANCE_URL }}
+          SN_SDK_OAUTH_CLIENT_ID: ${{ secrets.SN_SDK_OAUTH_CLIENT_ID }}
+          SN_SDK_OAUTH_CLIENT_SECRET: ${{ secrets.SN_SDK_OAUTH_CLIENT_SECRET }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          npx now-sdk cicd publish --app-version "$VERSION"
+          echo "app-version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  install-staging:
+    name: Install staging from Application Repository & run ATF gate
+    needs: publish-to-app-repo
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install from Application Repository
+        env:
+          SN_SDK_NODE_ENV: SN_SDK_CI_INSTALL
+          SN_SDK_AUTH_TYPE: oauth
+          SN_SDK_INSTANCE_URL: ${{ vars.SN_SDK_INSTANCE_URL }}
+          SN_SDK_OAUTH_CLIENT_ID: ${{ secrets.SN_SDK_OAUTH_CLIENT_ID }}
+          SN_SDK_OAUTH_CLIENT_SECRET: ${{ secrets.SN_SDK_OAUTH_CLIENT_SECRET }}
+        run: npx now-sdk cicd install --app-version "${{ needs.publish-to-app-repo.outputs.app-version }}"
+
+      - name: Run ATF gate suite
+        env:
+          SN_SDK_NODE_ENV: SN_SDK_CI_INSTALL
+          SN_SDK_AUTH_TYPE: oauth
+          SN_SDK_INSTANCE_URL: ${{ vars.SN_SDK_INSTANCE_URL }}
+          SN_SDK_OAUTH_CLIENT_ID: ${{ secrets.SN_SDK_OAUTH_CLIENT_ID }}
+          SN_SDK_OAUTH_CLIENT_SECRET: ${{ secrets.SN_SDK_OAUTH_CLIENT_SECRET }}
+        run: npx now-sdk cicd testsuite run --test-suite-sys-id "${{ vars.ATF_TEST_SUITE_ID }}"
+
+  gate:
+    name: Required promotion checks
+    needs: [build, publish-to-app-repo, install-staging]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Fail if any required job did not succeed
+        run: |
+          for result in "${{ needs.build.result }}" "${{ needs.publish-to-app-repo.result }}" "${{ needs.install-staging.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "A required promotion check did not succeed (status: $result)."
+              exit 1
+            fi
+          done
