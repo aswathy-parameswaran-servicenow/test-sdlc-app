@@ -24,7 +24,9 @@ name: Promote to staging
 
 on:
   push:
-    branches: [main]
+    # TEMPORARY: pipeline-v2 added to self-trigger for pre-merge testing.
+    # Revert to just [main] before merging this branch.
+    branches: [main, pipeline-v2]
   workflow_dispatch: {}
 
 # staging is a single shared external resource -- serialize promotions
